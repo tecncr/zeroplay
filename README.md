@@ -364,8 +364,11 @@ If an initial path is given it auto-loops at startup so the screen is live immed
 | `pause` | Pause playback |
 | `resume` | Resume playback |
 | `stop` | Stop and hold last frame |
-| `seek` | `positionMs` | Seek to position in milliseconds |
+| `seek <positionMs>` | Seek to position in milliseconds |
 | `quit` | Exit cleanly |
+| `status` | Reply with `status <idle\|playing\|paused\|image> <positionMs> <durationMs>` (`durationMs` is `0` when unknown) |
+| `events on` / `events off` | Opt in to the extended events below; replies `events on` / `events off` |
+| `loadat <positionMs> <path>` | Like `load`, but start playback at `positionMs` |
 
 ### Events (stdout)
 
@@ -373,6 +376,13 @@ If an initial path is given it auto-loops at startup so the screen is live immed
 |---|---|
 | `ready` | Emitted at startup when display is initialised |
 | `ended` | Emitted when a non-looping clip or image finishes |
+| `loaded <durationMs>` | After `events on`: a `load`/`loadat`/`loadloop` succeeded (`0` = unknown duration) |
+| `error load` | After `events on`: a `load`/`loadat`/`loadloop` failed (details on stderr) |
+
+Unknown commands are ignored, so a controller can probe for these extensions: send
+`events on` after `ready` and treat a missing `events on` reply as an older ZeroPlay
+that only supports the base commands. Because events are written in command order, any
+`ended` read before the `loaded`/`error load` of a new clip belongs to the previous clip.
 
 Useful for Python scripts, kiosk controllers, or any local process that needs seamless clip switching without WebSocket overhead.
 

@@ -1,5 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
@@ -377,6 +379,7 @@ typedef struct {
     int          separate_audio;
     int64_t      image_duration_us;
     int64_t      duration_us;
+    int64_t      start_override_us; /* control-mode "loadat": >0 overrides --pos once */
     DrmContext  *drm_ctx;
 } PlayerContext;
 
@@ -672,9 +675,14 @@ static int player_open_video(PlayerContext *p, const char *filename,
     p->duration_us   = p->demux.duration_us;
     p->pipeline_open = 1;
 
-    if (opt->start_pos > 0.0) {
-        int64_t start_us = (int64_t)(opt->start_pos * 1000000.0);
-        if (start_us > p->duration_us) start_us = p->duration_us;
+    int64_t start_us = 0;
+    if (p->start_override_us > 0)
+        start_us = p->start_override_us;
+    else if (opt->start_pos > 0.0)
+        start_us = (int64_t)(opt->start_pos * 1000000.0);
+    p->start_override_us = 0;
+    if (start_us > 0) {
+        if (p->duration_us > 0 && start_us > p->duration_us) start_us = p->duration_us;
         demux_seek(&p->demux, start_us);
         if (p->audio_active && p->separate_audio)
             demux_seek(&p->demux_audio, start_us);
@@ -1107,8 +1115,14 @@ static int run_ws_mode(Options *opt)
 /*   pause / resume   pause / resume playback                           */
 /*   stop             close the pipeline (holds last frame)             */
 /*   quit             exit cleanly (restores the console)               */
+/*   status           reply "status <idle|playing|paused|image>          */
+/*                    <positionMs> <durationMs>" (durationMs 0=unknown)  */
+/*   events on|off    opt in to extended events; replies "events on|off" */
+/*   loadat <ms> <p>  like load, starting at <ms> milliseconds           */
 /* Events (on stdout): "ready" at startup, "ended" when a non-looping    */
-/* clip finishes.                                                       */
+/* clip finishes. With "events on": "loaded <durationMs>" once a load    */
+/* succeeds and "error load" when it fails. Unknown commands are ignored */
+/* so controllers can probe for these extensions.                       */
 /* ------------------------------------------------------------------ */
 
 /* Non-blocking line reader over stdin. Returns 1 and fills `line`
@@ -1177,6 +1191,7 @@ static int run_control_mode(Options *opt)
     int  audio_started = 0;
     int  current_loop  = 0;
     int  play_image = 0;
+    int  ext_events = 0;  /* "events on": emit loaded/error lines */
     char current_path[PLAYLIST_ITEM_PATH_SIZE]  = "";
     char current_audio[PLAYLIST_ITEM_PATH_SIZE] = "";
 
@@ -1218,7 +1233,31 @@ static int run_control_mode(Options *opt)
             char *arg = strchr(cmd, ' ');
             if (arg) { *arg++ = '\0'; while (*arg == ' ') arg++; }
 
-            if ((strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0)
+            int64_t loadat_us = 0;
+            int     is_loadat = 0;
+            if (strcmp(cmd, "loadat") == 0 && arg && *arg) {
+                /* loadat <positionMs> <path>: validate, then treat as load. */
+                char *endp = NULL;
+                errno = 0;
+                long long ms = strtoll(arg, &endp, 10);
+                if (endp == arg || *endp != ' ' || errno || ms < 0
+                        || ms > INT64_MAX / 1000) {
+                    fprintf(stderr, "zeroplay: usage loadat <positionMs> <path>\n");
+                    if (ext_events) { printf("error load\n"); fflush(stdout); }
+                    continue;
+                }
+                arg = endp;
+                while (*arg == ' ') arg++;
+                if (!*arg) {
+                    fprintf(stderr, "zeroplay: usage loadat <positionMs> <path>\n");
+                    if (ext_events) { printf("error load\n"); fflush(stdout); }
+                    continue;
+                }
+                loadat_us = (int64_t)ms * 1000;
+                is_loadat = 1;
+            }
+
+            if ((is_loadat || strcmp(cmd, "load") == 0 || strcmp(cmd, "loadloop") == 0)
                     && arg && *arg) {
                 PlaylistItemType type = type_from_ext(arg);
                 int loop = (strcmp(cmd, "loadloop") == 0);
@@ -1236,6 +1275,9 @@ static int run_control_mode(Options *opt)
                                 player.output_idx, basename(arg));
 
                         play_image = 1;
+                        if (ext_events) { printf("loaded 0\n"); fflush(stdout); }
+                    } else if (ext_events) {
+                        printf("error load\n"); fflush(stdout);
                     }
                 } else{
                     /* Seamless looping is per clip here, not per session: the
@@ -1246,10 +1288,14 @@ static int run_control_mode(Options *opt)
 
                     play_image = 0;
                     parse_separated_video_audio_url(arg, current_path, current_audio);
-                    if (player_open_video(&player, current_path, current_audio, opt) < 0) {
+                    player.start_override_us = loadat_us;
+                    int open_rc = player_open_video(&player, current_path, current_audio, opt);
+                    player.start_override_us = 0; /* never leak into a later load */
+                    if (open_rc < 0) {
                         fprintf(stderr, "zeroplay: failed to open '%s'\n", current_path);
                         current_path[0] = '\0';
                         current_loop    = 0;
+                        if (ext_events) { printf("error load\n"); fflush(stdout); }
                     } else {
                         if (player.audio_active) audio_pause(&player.audio);
 
@@ -1257,6 +1303,12 @@ static int run_control_mode(Options *opt)
                         current_loop = loop;
                         fprintf(stderr, "zeroplay: %s %s\n",
                                 loop ? "loadloop" : "load", current_path);
+                        if (ext_events) {
+                            long long dur_ms = player.duration_us > 0
+                                             ? (long long)(player.duration_us / 1000) : 0;
+                            printf("loaded %lld\n", dur_ms);
+                            fflush(stdout);
+                        }
                     }
                 }
             } else if (strcmp(cmd, "osd") == 0 && arg && *arg) {
@@ -1337,6 +1389,23 @@ static int run_control_mode(Options *opt)
                             audio_pause(&player.audio);
                     }
                 }
+            } else if (strcmp(cmd, "status") == 0) {
+                const char *st = "idle";
+                long long pos_ms = 0, dur_ms = 0;
+                if (play_image) {
+                    st = "image";
+                } else if (player.pipeline_open) {
+                    st     = paused ? "paused" : "playing";
+                    pos_ms = player.current_pts > 0 ? (long long)(player.current_pts / 1000) : 0;
+                    dur_ms = player.duration_us > 0 ? (long long)(player.duration_us / 1000) : 0;
+                }
+                printf("status %s %lld %lld\n", st, pos_ms, dur_ms);
+                fflush(stdout);
+            } else if (strcmp(cmd, "events") == 0 && arg
+                       && (strcmp(arg, "on") == 0 || strcmp(arg, "off") == 0)) {
+                ext_events = (strcmp(arg, "on") == 0);
+                printf("events %s\n", ext_events ? "on" : "off");
+                fflush(stdout);
             } else if (strcmp(cmd, "quit") == 0) {
                 g_signal_quit = 1;
             }
